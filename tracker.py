@@ -1,6 +1,7 @@
 import cv2
 import mediapipe as mp
 import numpy as np
+from collections import deque
 
 class EyeTracker:
     def __init__(self):
@@ -19,6 +20,17 @@ class EyeTracker:
         self.LEFT_CHEEK = 234   # Sol Yanak
         self.RIGHT_CHEEK = 454  # Sağ Yanak
 
+        # --- Hareketli Ortalama Buffer (Gecikmeyi azaltır) ---
+        self.pitch_buffer = deque(maxlen=4)  # Son 4 frame'in pitch değerini tut
+        self.yaw_buffer = deque(maxlen=4)    # Son 4 frame'in yaw değerini tut
+        self.position_buffer = deque(maxlen=3)  # Konum için buffer
+
+        # --- Geliştirilmiş Eşik Değerleri ---
+        self.pitch_up_threshold = 0.37      # Yukarı bakış eşiği (daha hassas)
+        self.pitch_down_threshold = 0.63    # Aşağı bakış eşiği (daha hassas)
+        self.yaw_left_threshold = 0.27      # Sol dönüş eşiği
+        self.yaw_right_threshold = 0.73     # Sağ dönüş eşiği
+
     def check_focus(self, frame):
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(rgb_frame)
@@ -29,7 +41,7 @@ class EyeTracker:
 
         # --- 1. GÜVENLİ ALAN (Kişinin çerçeve içinde kalması için) ---
         safe_x_min, safe_x_max = 0.20, 0.80 
-        safe_y_min, safe_y_max = 0.25, 0.85 # Biraz daha genişlettik
+        safe_y_min, safe_y_max = 0.25, 0.85
 
         # Çerçeveyi Çiz
         cv2.rectangle(frame, 
@@ -53,18 +65,21 @@ class EyeTracker:
             y_chin = mesh[self.CHIN].y
 
             # --- KONTROL 1: KONUM (Sandalye pozisyonu) ---
-            # Kişi fiziksel olarak ekranın dışına taşıyor mu?
-            if nose.x < safe_x_min:
+            position_data = (nose.x, nose.y)
+            self.position_buffer.append(position_data)
+            avg_x = np.mean([p[0] for p in self.position_buffer])
+            avg_y = np.mean([p[1] for p in self.position_buffer])
+
+            if avg_x < safe_x_min:
                 focused = False
                 warning_msg = "SAG TARAFA KAYDINIZ"
-            elif nose.x > safe_x_max:
+            elif avg_x > safe_x_max:
                 focused = False
                 warning_msg = "SOL TARAFA KAYDINIZ"
-            elif nose.y < safe_y_min:
-                # Burası fiziksel olarak çok yukarı kalkarsa (ayağa kalkma vb.)
+            elif avg_y < safe_y_min:
                 focused = False
                 warning_msg = "CERCEVEDEN CIKTINIZ (UST)"
-            elif nose.y > safe_y_max:
+            elif avg_y > safe_y_max:
                 focused = False
                 warning_msg = "CERCEVEDEN CIKTINIZ (ALT)"
 
@@ -79,42 +94,40 @@ class EyeTracker:
             
             if face_width > 0:
                 yaw_ratio = dist_to_left / face_width
-                if yaw_ratio < 0.25:
+                self.yaw_buffer.append(yaw_ratio)
+                
+                # Hareketli ortalama al
+                avg_yaw = np.mean(list(self.yaw_buffer)) if len(self.yaw_buffer) > 0 else yaw_ratio
+                
+                if avg_yaw < self.yaw_left_threshold:
                     focused = False
                     warning_msg = "BASINIZI CEVIRMEYIN (SOL)"
-                elif yaw_ratio > 0.75:
+                elif avg_yaw > self.yaw_right_threshold:
                     focused = False
                     warning_msg = "BASINIZI CEVIRMEYIN (SAG)"
 
             # --- KONTROL 3: KAFA EĞİMİ (YUKARI / AŞAĞI - PITCH) ---
-            # YENİ EKLENEN KISIM BURASI
-            # Mantık: Burnun, Alın ile Çene arasındaki dikey konumu.
-            # Normalde burun, alın ile çenenin ortasındadır.
-            # Yukarı bakınca (kafayı geriye atınca) burun alına görsel olarak yaklaşır.
-            # Aşağı bakınca (kafayı eğince) burun çeneye yaklaşır.
-            
             face_vertical_height = y_chin - y_forehead
             
-            # Burun alından ne kadar uzakta? (Oransal olarak)
-            nose_position_ratio = (y_nose - y_forehead) / face_vertical_height
+            if face_vertical_height > 0:
+                nose_position_ratio = (y_nose - y_forehead) / face_vertical_height
+                self.pitch_buffer.append(nose_position_ratio)
+                
+                # Hareketli ortalama al - DAHA HIZLI ALGILAMA İÇİN
+                avg_pitch = np.mean(list(self.pitch_buffer)) if len(self.pitch_buffer) > 0 else nose_position_ratio
 
-            # --- AYARLANABİLİR EŞİKLER ---
-            # Bu değerler kafa eğimini algılar. 
-            # 0.35 altı = Yukarı bakıyor (Burun alına çok yakın)
-            # 0.65 üstü = Aşağı bakıyor (Burun çeneye çok yakın)
-            
-            if nose_position_ratio < 0.35: 
-                focused = False
-                warning_msg = "YUKARI BAKTINIZ"
-            elif nose_position_ratio > 0.65:
-                focused = False
-                warning_msg = "ASAGI BAKTINIZ"
+                if avg_pitch < self.pitch_up_threshold: 
+                    focused = False
+                    warning_msg = "YUKARI BAKTINIZ"
+                elif avg_pitch > self.pitch_down_threshold:
+                    focused = False
+                    warning_msg = "ASAGI BAKTINIZ"
 
             # Görselleştirme
             color = (0, 255, 0) if focused else (0, 0, 255)
             cv2.circle(frame, nose_coords, 5, color, -1)
 
-            # Debug için alın ve çeneyi de çizelim (İsteğe bağlı)
+            # Debug için alın ve çeneyi de çizelim
             cv2.circle(frame, get_coords(self.FOREHEAD), 3, (0, 255, 255), -1)
             cv2.circle(frame, get_coords(self.CHIN), 3, (0, 255, 255), -1)
 
